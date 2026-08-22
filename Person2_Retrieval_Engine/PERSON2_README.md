@@ -14,6 +14,24 @@
 | `retrieve(query, language, top_k)` contract | ✅ | `retrieval_engine.py` |
 | Latency benchmark | ✅ | `benchmark_retrieval.py` |
 
+============================================================
+RETRIEVAL-ONLY LATENCY RESULTS
+============================================================
+Metric               P50 (ms)     P70 (ms)     P100 (ms)
+------------------------------------------------------------
+Total retrieval      23.91        25.83        71.92
+
+Queries run       : 30
+Mean total time   : 25.77 ms
+Min total time    : 18.30 ms
+Max total time    : 71.92 ms
+
+Top score P50     : 0.000
+Top score P70     : 0.000
+Top score P100    : 0.000
+
+P100 retrieval    : 71.92 ms  ✅ UNDER 200ms
+
 ## Quick Start
 
 ### 1. Install dependencies
