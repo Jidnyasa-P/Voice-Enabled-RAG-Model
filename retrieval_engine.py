@@ -14,6 +14,17 @@ Usage:
     engine = RetrievalEngine()
     engine.build_index(languages=["hi", "en", "ta"])
     results = engine.retrieve("भारत की राजधानी क्या है?", language="hi", top_k=3)
+
+Notes on the real ai4bharat/MSMARCO-XI schema (verified against the HF
+dataset card, not assumed):
+  - "passages" is a DICT with keys is_selected / English_passages /
+    Translated_passages — not a list of passage strings.
+  - Valid HF configs are the 14 Indic codes (as, bn, gu, hi, kn, ml, mr,
+    ne, or, pa, sa, ta, te, ur). There is no "en" config; English text
+    lives in every config's passages["English_passages"].
+  - The unique id field is "query_id", not "id".
+  - source_lang/target_lang are script-tagged codes like "hin_Deva", not
+    the short "hi"/"ta" codes used elsewhere in this pipeline.
 """
 
 import os
@@ -38,10 +49,101 @@ DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-
 DEFAULT_RERANKER = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_LANGUAGES = ["hi", "en", "ta"]          # Hindi, English, Tamil
 DEFAULT_MAX_EXAMPLES = 1000                       # per language, tune as needed
+
+# Real ai4bharat/MSMARCO-XI HuggingFace configs (confirmed against the dataset
+# card). There is NO "en" config — English text only exists as the
+# "English_passages" field nested inside every Indic-language config.
+VALID_HF_LANGUAGE_CONFIGS = {
+    "as", "bn", "gu", "hi", "kn", "ml", "mr",
+    "ne", "or", "pa", "sa", "ta", "te", "ur",
+}
+# Which HF config to pull English_passages from when "en" is requested.
+ENGLISH_SOURCE_CONFIG = "hi"
+
+# HF removed support for `trust_remote_code` loading scripts, which is what
+# this dataset used to expose the per-language configs above as loadable
+# `load_dataset("ai4bharat/MSMARCO-XI", "hi", ...)` names. Without that
+# script, the repo now reports only a single "default" config, and
+# `load_dataset(..., "hi", ...)` fails with "BuilderConfig 'hi' not found".
+# The actual data still exists — as separate parquet files per language,
+# named per the dataset card's own file table (short code -> file prefix).
+# We now load those files directly instead of relying on the config name.
+LANG_FILE_PREFIX = {
+    "as": "asm", "bn": "ben", "gu": "gu", "hi": "hin", "kn": "kan",
+    "ml": "mal", "mr": "mar", "ne": "nep", "or": "or", "pa": "pan",
+    "sa": "san", "ta": "tam", "te": "tel", "ur": "urd",
+}
+
 CHUNK_FIXED_SIZE = 256
 CHUNK_FIXED_OVERLAP = 40
 SEMANTIC_THRESHOLD = 0.65
 BATCH_SIZE = 500                                  # Chroma add batch size
+
+
+def load_lang_dataset(hf_config: str, max_rows: int = None):
+    """
+    Load one language's data directly from its parquet file.
+
+    Uses DuckDB's native parquet reader instead of pyarrow/HF `datasets`.
+
+    Root cause of the earlier failures (confirmed against Apache Arrow's
+    own bug tracker — ARROW-4688 / ARROW-5030 / ARROW-17459, open since
+    2019, still unresolved as of the pyarrow version in this venv): when
+    a nested column's (here, `passages`, a struct of lists) byte data
+    *within a single row group* exceeds an internal ~16MB chunk
+    threshold, Arrow's C++ nested-array reconstruction code
+    (`WrapIntoListArray`) cannot handle the resulting chunked array and
+    raises:
+
+        pyarrow.lib.ArrowNotImplementedError: Nested data conversions
+        not implemented for chunked array outputs
+
+    This affects EVERY pyarrow-based access pattern equally — HF
+    `datasets` streaming, `pq.read_table()` (which internally goes
+    through the same `pyarrow.dataset.Scanner` C++ path), and even
+    `ParquetFile.read_row_group()` on a single group — because the bug
+    lives inside Arrow's own Parquet-to-Arrow conversion code, not in
+    any particular Python-level API choice.
+
+    DuckDB ships its own from-scratch native C++ Parquet reader — it
+    does not use Apache Arrow's `arrow/reader.cc` code at all, so it
+    doesn't share this bug. Verified structurally correct row shape
+    (`passages` comes back as the expected nested dict) against this
+    dataset's real schema.
+
+    Only pulls the 4 columns build_index() actually uses (query_id,
+    passages, source_lang, target_lang) — skips the large unused text
+    columns to keep memory and read time down.
+    """
+    import duckdb
+    from huggingface_hub import hf_hub_download
+
+    prefix = LANG_FILE_PREFIX.get(hf_config)
+    if not prefix:
+        raise ValueError(f"Unknown MSMARCO-XI language config: {hf_config!r}")
+    filename = f"train/{prefix}train.parquet"
+
+    # Uses the local HF cache if already downloaded from an earlier
+    # attempt — will NOT re-download.
+    local_path = hf_hub_download(
+        repo_id="ai4bharat/MSMARCO-XI",
+        filename=filename,
+        repo_type="dataset",
+    )
+
+    con = duckdb.connect()
+    limit_clause = f"LIMIT {int(max_rows)}" if max_rows is not None else ""
+    # DuckDB needs backslashes escaped / forward slashes for Windows paths
+    safe_path = local_path.replace("\\", "/")
+    query = f"""
+        SELECT query_id, passages, source_lang, target_lang
+        FROM read_parquet('{safe_path}')
+        {limit_clause}
+    """
+    df = con.execute(query).df()
+    con.close()
+
+    return df.to_dict(orient="records")  # list[dict] — same per-row shape as an HF Dataset
 
 
 def _cosine_similarity(a, b) -> float:
@@ -208,14 +310,39 @@ class RetrievalEngine:
         print(f"[build_index] Max examples per language: {max_examples_per_lang}")
 
         total_chunks = 0
+        # Cache loaded HF datasets by config name so requesting "en" (which
+        # reuses ENGLISH_SOURCE_CONFIG) doesn't trigger a second download of
+        # a config we already pulled for its own language.
+        ds_cache: Dict[str, Any] = {}
 
         for lang in languages:
             print(f"\n--- Processing language: {lang} ---")
-            try:
-                ds = load_dataset("ai4bharat/MSMARCO-XI", lang, split="train", trust_remote_code=True)
-            except Exception as e:
-                print(f"  ⚠️  Failed to load dataset for '{lang}': {e}")
+
+            # "en" is not a real MSMARCO-XI config — English text is nested
+            # inside every Indic config as passages["English_passages"].
+            if lang == "en":
+                hf_config = ENGLISH_SOURCE_CONFIG
+                passage_field = "English_passages"
+            elif lang in VALID_HF_LANGUAGE_CONFIGS:
+                hf_config = lang
+                passage_field = "Translated_passages"
+            else:
+                print(f"  ⚠️  '{lang}' is not a valid MSMARCO-XI language config "
+                      f"({sorted(VALID_HF_LANGUAGE_CONFIGS)} + 'en'); skipping")
                 continue
+
+            if hf_config in ds_cache:
+                ds = ds_cache[hf_config]
+            else:
+                try:
+                    ds = load_lang_dataset(hf_config, max_rows=max_examples_per_lang)
+                    ds_cache[hf_config] = ds
+                    print(f"  ✅ Loaded {len(ds)} rows for '{hf_config}' from local parquet cache")
+                except Exception as e:
+                    print(f"  ⚠️  Failed to load dataset for config '{hf_config}': {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
 
             batch_ids: List[str] = []
             batch_texts: List[str] = []
@@ -227,10 +354,23 @@ class RetrievalEngine:
                 if example_count >= max_examples_per_lang:
                     break
 
-                query_id = example.get("id", f"{lang}_{example_count}")
-                passages = example.get("passages", [])
-                source_lang = example.get("source_lang", lang)
-                target_lang = example.get("target_lang", lang)
+                if example_count > 0 and example_count % 25 == 0:
+                    print(f"  ...{example_count}/{max_examples_per_lang} examples processed "
+                          f"({lang_chunk_count} chunks so far)")
+
+                # Real unique-id field is "query_id", not "id".
+                query_id = example.get("query_id", f"{lang}_{example_count}")
+
+                # "passages" is a DICT ({"is_selected": [...], "English_passages":
+                # [...], "Translated_passages": [...]}), not a list of strings.
+                # Iterating it directly with enumerate() walks its *keys*
+                # ("is_selected", "English_passages", ...) — each of which is
+                # itself a string, so the old isinstance(passage, str) check
+                # silently accepted them as if they were passage text.
+                passages_dict = example.get("passages") or {}
+                passages = passages_dict.get(passage_field, []) if isinstance(passages_dict, dict) else []
+                source_lang = example.get("source_lang", "")
+                target_lang = example.get("target_lang", "")
 
                 if not passages:
                     example_count += 1
@@ -252,12 +392,22 @@ class RetrievalEngine:
                             if not chunk or not chunk.strip():
                                 continue
 
-                            chunk_id = f"{query_id}_p{p_idx}_{strategy_name}_{c_idx}"
+                            chunk_id = f"{lang}_{query_id}_p{p_idx}_{strategy_name}_{c_idx}"
                             metadata = {
-                                "language": str(target_lang),
+                                # Use the SAME short code ("hi", "en", "ta", ...)
+                                # that build_index() was called with and that
+                                # retrieve() is called with — not the dataset's
+                                # own target_lang value (e.g. "hin_Deva"), which
+                                # never matches the short codes used at query
+                                # time. This is what makes the language filter
+                                # in retrieve() actually work.
+                                "language": lang,
                                 "source_query_id": str(query_id),
                                 "strategy": strategy_name,
-                                "source_lang": str(source_lang),
+                                # Kept for reference/debugging only — NOT used
+                                # for filtering.
+                                "dataset_source_lang": str(source_lang),
+                                "dataset_target_lang": str(target_lang),
                             }
 
                             batch_ids.append(chunk_id)
@@ -277,7 +427,8 @@ class RetrievalEngine:
                 self._flush_batch(batch_ids, batch_texts, batch_metadatas)
                 batch_ids, batch_texts, batch_metadatas = [], [], []
 
-            print(f"  ✅ {lang}: {example_count} examples → {lang_chunk_count} chunks")
+            print(f"  ✅ {lang} (HF config '{hf_config}', field '{passage_field}'): "
+                  f"{example_count} examples → {lang_chunk_count} chunks")
             total_chunks += lang_chunk_count
 
         print(f"\n🎉 Index build complete! Total chunks indexed: {self.collection.count()}")

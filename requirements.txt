@@ -1,0 +1,23 @@
+# Voice-Enabled RAG — merged project dependencies
+# Install: pip install -r requirements.txt
+
+# --- Speech-to-text & guardrail LLM calls (Sarvam) ---
+# used by: guardrails.py, test_guardrails.py, test_grounding.py, test_sarvam_stt.py
+sarvamai>=0.1.30
+
+# --- Retrieval engine ---
+# used by: retrieval_engine.py, build_index.py, benchmark_retrieval.py, debug_panel.py, test_retrieval.py
+chromadb>=0.4.0
+sentence-transformers>=2.3.0
+datasets>=2.14.0
+huggingface_hub>=0.20.0
+duckdb>=0.10.0
+numpy>=1.24.0
+
+# --- Orchestration & deployment ---
+# used by: app.py (Streamlit UI). pipeline.py, generation.py, retry_utils.py
+# have no extra third-party deps beyond the ones above.
+streamlit>=1.32.0
+
+# (Optional) faster sentence splitting across languages
+# nltk>=3.8

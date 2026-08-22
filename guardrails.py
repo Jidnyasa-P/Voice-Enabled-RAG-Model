@@ -17,7 +17,7 @@ import json
 import time
 from sarvamai import SarvamAI
 
-API_KEY = os.environ.get("SARVAM_API_KEY", "PASTE_YOUR_API_KEY_HERE")
+API_KEY = os.environ.get("SARVAM_API_KEY", "PASTE_API_KEY_HERE")
 _client = SarvamAI(api_subscription_key=API_KEY)
 
 MODEL = "sarvam-105b"  # only supported Sarvam chat model as of Aug 2026
