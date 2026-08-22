@@ -1,0 +1,9 @@
+# Voice-Enabled RAG — merged project dependencies
+sarvamai>=0.1.30
+chromadb>=0.4.0
+sentence-transformers>=2.3.0
+datasets>=2.14.0
+huggingface_hub>=0.20.0
+duckdb>=0.10.0
+numpy>=1.24.0
+streamlit>=1.32.0
